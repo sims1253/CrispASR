@@ -54,13 +54,17 @@
 #include <cblas.h>
 #endif
 
-// Forces parakeet_gemv onto the bit-identical scalar reference.
+// Forces parakeet_gemv onto the bit-identical scalar reference. Only defined
+// when at least one fast path exists (otherwise there's nothing to opt out of).
+#if defined(HAVE_ACCELERATE) || defined(HAVE_BLAS) || defined(HAVE_PARAKEET_FAST_BLAS) || \
+    (defined(__x86_64__) && defined(HAVE_PARAKEET_SIMD))
 static bool parakeet_use_scalar() {
     static int v = -1;
     if (v < 0)
         v = (getenv("PARAKEET_FORCE_SCALAR") != nullptr) ? 1 : 0;
     return v != 0;
 }
+#endif
 
 // §223 portable SIMD gemv kernels for the predictor + joint matmuls. AVX2+FMA
 // (runtime-detected) or SSE2 baseline; preferred over cblas on x86 since the
