@@ -1819,9 +1819,12 @@ static bool parakeet_gpu_init_utterance(parakeet_context* ctx, const float* enc,
 }
 
 // Run one GPU decode step. Returns the argmax token id; sets *dur_id_out to
-// the duration-logit argmax and *tok_p_out to the softmax prob of the token.
-// frame_idx and token are the runtime inputs; the LSTM state is mutated
-// in-graph on the GPU.
+// the duration-logit argmax. frame_idx and token are the runtime inputs; the
+// LSTM state is mutated in-graph on the GPU.
+//
+// Read-back per step is minimized: argmax id (4B) + dur_id (4B) = 8 bytes.
+// The token softmax prob is read back ONLY on emitted tokens (tok_p_out !=
+// nullptr), not on every step — blanks dominate the step count and don't need it.
 static int parakeet_gpu_step(parakeet_context* ctx, int frame_idx, int token, int* dur_id_out, float* tok_p_out) {
     ggml_cgraph* gf = parakeet_gpu_build_pred_graph(ctx);
 
@@ -1849,14 +1852,15 @@ static int parakeet_gpu_step(parakeet_context* ctx, int frame_idx, int token, in
         return -1;
     }
 
-    // Read back only the argmax id (4 bytes) + duration argmax + token prob.
+    // Read back: argmax id (4B) + duration argmax (host-side over 5 values).
     int32_t tok_id = -1;
     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "argmax"), &tok_id, 0, sizeof(int32_t));
 
     const int n_vocab_blk = (int)ctx->model.hparams.blank_id + 1;
     const int n_dur = (int)ctx->model.hparams.n_tdt_durations;
     if (dur_id_out) {
-        std::vector<float> dur_logits(n_dur);
+        // Read only the n_dur duration logits (5 floats = 20 bytes).
+        std::array<float, 8> dur_logits{};
         ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), dur_logits.data(),
                                 (size_t)n_vocab_blk * sizeof(float), n_dur * sizeof(float));
         int did = 0;
@@ -1865,15 +1869,16 @@ static int parakeet_gpu_step(parakeet_context* ctx, int frame_idx, int token, in
                 did = d;
         *dur_id_out = did;
     }
-    // Token softmax prob (host-side over the picked token's vocab half).
+    // Token softmax prob — read back only when requested (i.e. on emit), not
+    // every step. This avoids a 32KB D2H + sync for the ~75% of steps that
+    // produce blanks and don't need the probability.
     if (tok_p_out) {
-        std::vector<float> vocab_logits(n_vocab_blk);
+        static thread_local std::vector<float> vocab_logits;
+        if ((int)vocab_logits.size() < n_vocab_blk)
+            vocab_logits.resize(n_vocab_blk);
         ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), vocab_logits.data(), 0,
                                 n_vocab_blk * sizeof(float));
-        float mx = vocab_logits[0];
-        for (int v = 1; v < n_vocab_blk; v++)
-            if (vocab_logits[v] > mx)
-                mx = vocab_logits[v];
+        float mx = vocab_logits[tok_id];
         double sum = 0.0;
         for (int v = 0; v < n_vocab_blk; v++)
             sum += std::exp((double)(vocab_logits[v] - mx));
@@ -1916,8 +1921,9 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
     int total_steps = 0;
     while (t < T_enc) {
         int dur_id = 0;
-        float tok_p = 1.0f;
-        int tok = parakeet_gpu_step(ctx, std::min(t, T_enc - 1), last_token, &dur_id, &tok_p);
+        // Step without the prob readback (blank steps don't need it — saves a
+        // 32KB D2H + sync on ~75% of steps).
+        int tok = parakeet_gpu_step(ctx, std::min(t, T_enc - 1), last_token, &dur_id, nullptr);
         if (tok < 0)
             return emitted;
         total_steps++;
@@ -1933,6 +1939,24 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
             continue;
         }
 
+        // Real token: read the softmax prob now (only on emit — ~37 times,
+        // not ~47 steps). The logits tensor is still GPU-resident from the
+        // last compute.
+        float tok_p = 1.0f;
+        {
+            const int n_vocab_blk = blank_id + 1;
+            static thread_local std::vector<float> vocab_logits;
+            if ((int)vocab_logits.size() < n_vocab_blk)
+                vocab_logits.resize(n_vocab_blk);
+            ggml_cgraph* gf = ctx->gpu.gf_pred;
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), vocab_logits.data(), 0,
+                                    n_vocab_blk * sizeof(float));
+            float mx = vocab_logits[tok];
+            double sum = 0.0;
+            for (int v = 0; v < n_vocab_blk; v++)
+                sum += std::exp((double)(vocab_logits[v] - mx));
+            tok_p = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
+        }
         // Real token: emit and advance.
         int t_end = std::min(T_enc, t + std::max(0, dur_skip));
         emitted.push_back({tok, t, t_end, tok_p});
