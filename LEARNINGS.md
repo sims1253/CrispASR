@@ -10,6 +10,49 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## The parakeet TDT decode loop is a hand-rolled scalar gemv hot path — and the Netlib reference BLAS is slower than a 30-line AVX2 kernel (§223)
+
+The parakeet-tdt-0.6b-v3 decoder (predictor LSTM + joint head) is NOT a ggml
+graph — it's hand-written C++ (`predictor_step` / `joint_step` in
+`src/parakeet.cpp`), because the per-step shape depends on runtime argmax
+results (data-dependent control flow ggml can't express without graph
+rebuilds). On CPU that means every decode step runs two 2560×640 LSTM gemv's
+and one 8198×640 joint-output gemv as **scalar `for` loops**, plus a fresh
+`std::vector` allocation for each. That scalar loop was 93 % of decode time.
+
+Three things that are NOT obvious until you measure:
+
+1. **The per-step `std::vector` allocations were real but small.** Hoisting
+   them into a reusable workspace (`parakeet_decode_workspace`) helped, but the
+   dominant cost was the raw FLOPs, not the allocator. Profile before assuming
+   "allocs are the bottleneck."
+
+2. **The Netlib reference BLAS (`libblas.so`, what `find_package(BLAS)` finds
+   on a bare Debian/Ubuntu) is SLOWER than a 30-line hand-rolled AVX2/FMA
+   gemv.** Wiring `cblas_sgemv` unconditionally (mirroring the mel/cohere
+   `HAVE_BLAS` pattern) made decode *slower* (514 ms vs 446 ms scalar) until
+   the dispatch was reordered to prefer the SIMD kernel and only defer to BLAS
+   when it's OpenBLAS/MKL (`HAVE_PARAKEET_FAST_BLAS`). Lesson: **"link a BLAS"
+   is not a free win — reference BLAS exists and is slow.** Detect the
+   *optimized* BLAS specifically, or ship your own SIMD.
+
+3. **SIMD reassociation does NOT break greedy decode byte-exactness.** The
+   scalar loop accumulates `s += row[k]*x[k]` in strict left-to-right order;
+   AVX2 horizontal reduction reorders the sum (~1e-6 difference). That's the
+   same regime as the existing Accelerate `cblas_sgemv` path, and far below
+   the greedy-argmax decision margin (logits are rarely within 1e-6 of each
+   other at the picked index). The emitted token stream + word timestamps are
+   sha256-identical. "Byte-exact" for a greedy decoder means *identical
+   transcript*, not bit-identical floats — the scalar path stays as the
+   bit-identical reference behind `PARAKEET_FORCE_SCALAR`.
+
+The target-attribute trick (`__attribute__((target("avx2,fma")))`) lets the
+AVX2 function compile inside a non-AVX2 translation unit and dispatch at
+runtime via `ggml_cpu_has_avx2()` — no `-mavx2` global flag, no separate
+compile units. SSE2 is baseline x86-64 (no flag, no runtime check needed).
+See `parakeet_gemv` / `parakeet_gemv_avx2` / `parakeet_gemv_sse2` in
+`src/parakeet.cpp`. Result: 2.6× decode speedup, HISTORY §223.
+
 ## Two concurrent HuggingFace uploads from one machine cause spurious mid-batch failures — serialize them (#192 aligner re-ship)
 
 Uploading a batch of GGUFs while another `hf`/`upload_file` job runs on the same

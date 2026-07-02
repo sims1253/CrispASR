@@ -6,6 +6,46 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## §223 2026-07-02 parakeet TDT decode 2.6× faster (zero-alloc workspace + AVX2/SSE2 gemv)
+
+The parakeet-tdt-0.6b-v3 TDT/RNNT decode loop dominated CPU time — 446 ms of a
+0.8 s jfk transcription on a Ryzen 5900X (the FastConformer encoder ran on the
+RTX 5090 GPU, so the scalar C++ predictor LSTM + joint head was the wall-clock
+bottleneck). A `PARAKEET_DECODE_PROFILE` probe showed 46 % in `predictor_step`
+(two 4H×H = 2560×640 LSTM gemv's per step) and 48 % in `joint_step` (an
+8198×640 output gemv per step), both pure scalar C++ that allocated a fresh
+`std::vector` (gates / proj_e / logits / mid / pred_buf / embed_buf) on every
+step. Inspired by the starling parakeet work (whose CUDA-graph decode speedup
+is the PyTorch analog of "pre-allocated static buffers + minimal per-step
+overhead"), the same idea was expressed for the ggml/C++ decode loop.
+
+1. **`parakeet_decode_workspace`** — hoists every per-step `std::vector` into a
+   reusable buffer on `parakeet_context`, sized once. `lstm_step_layer` /
+   `predictor_step` / `joint_proj_enc` / `joint_step` now take raw `float*`
+   scratch; `std::vector` overloads (thread_local scratch) are kept for the
+   beam/MAES/CTC paths so those call sites are unchanged. ABI-safe (the
+   workspace is internal to `parakeet_context`).
+
+2. **`parakeet_gemv` dispatch + hand-rolled AVX2/FMA & SSE2 kernels** — target-
+   attribute multiversioning (`__attribute__((target("avx2,fma")))`) so the
+   AVX2 path compiles in a non-AVX2 TU and dispatches at runtime via
+   `ggml_cpu_has_avx2()`. SSE2 is the x86-64 baseline. On x86 this kernel is
+   preferred over cblas because the **Netlib reference BLAS (`libblas.so`) is
+   slower than the kernel** — only OpenBLAS/MKL (`HAVE_PARAKEET_FAST_BLAS`,
+   auto-detected by cmake) take priority. Apple keeps Accelerate.
+   `PARAKEET_FORCE_SCALAR` falls back to the bit-identical scalar reference.
+
+Result (Ryzen 5900X, AVX2+FMA, parakeet-tdt-0.6b-v3 f16, jfk 11 s): decode
+446 ms → 170 ms (**2.6×**), end-to-end 13.8× → 37.0× realtime. Transcript +
+word timestamps **byte-identical** to the scalar path (sha256-verified).
+SIMD changes the float summation order (~1e-6, same regime as the existing
+Accelerate `cblas_sgemv` path), far below the greedy-argmax decision margin.
+
+No new hard dependency: BLAS is optional (`CRISPASR_PARAKEET_BLAS`, default ON,
+links OpenBLAS/MKL only when present); the SIMD kernel needs no dep.
+Cross-platform: x86-64 gets AVX2/SSE2, Apple keeps Accelerate, everything else
+keeps the scalar reference. Branch `feat/parakeet-0.6b-v3-starling-port`.
+
 ## #192 2026-07-01 TADA CPU quality (last-word / tempo), cand>1 viability, `.wav` voice cloning + `--align`
 
 Closed out the CPU-side complaints in #192 and shipped the voice-cloning + forced-alignment

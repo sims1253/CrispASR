@@ -910,6 +910,38 @@ if(APPLE)
     target_compile_definitions(parakeet PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
 endif()
 
+# §223 cblas_sgemv for the TDT predictor + joint head gemv's. Only OpenBLAS/MKL
+# beat the hand-rolled AVX2/SSE2 kernel — the Netlib reference BLAS is slower —
+# so HAVE_PARAKEET_FAST_BLAS is defined only for those. Reference BLAS is left
+# unlinked so the SIMD kernel is used instead.
+option(CRISPASR_PARAKEET_BLAS "Use cblas_sgemv for the parakeet TDT predictor + joint head (§223)" ON)
+if(CRISPASR_PARAKEET_BLAS AND NOT APPLE AND NOT MSVC)
+    find_library(OPENBLAS_LIB openblas)
+    find_library(MKL_RT NAMES mkl_rt mkl_rt.so)
+    find_path(CBLAS_INCLUDE_DIR cblas.h PATH_SUFFIXES openblas)
+    if(OPENBLAS_LIB)
+        target_link_libraries(parakeet PUBLIC ${OPENBLAS_LIB})
+        if(CBLAS_INCLUDE_DIR)
+            target_include_directories(parakeet PRIVATE ${CBLAS_INCLUDE_DIR})
+        endif()
+        target_compile_definitions(parakeet PRIVATE HAVE_BLAS HAVE_PARAKEET_FAST_BLAS)
+        message(STATUS "parakeet: linking OpenBLAS (fast) for TDT decode gemv")
+    elseif(MKL_RT)
+        target_link_libraries(parakeet PUBLIC ${MKL_RT})
+        if(CBLAS_INCLUDE_DIR)
+            target_include_directories(parakeet PRIVATE ${CBLAS_INCLUDE_DIR})
+        endif()
+        target_compile_definitions(parakeet PRIVATE HAVE_BLAS HAVE_PARAKEET_FAST_BLAS)
+        message(STATUS "parakeet: linking MKL (fast) for TDT decode gemv")
+    endif()
+endif()
+
+# §223 portable SIMD gemv: SSE2 baseline, AVX2/FMA runtime-detected. Preferred
+# over reference BLAS on x86-64; OpenBLAS/MKL take priority when linked above.
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64)")
+    target_compile_definitions(parakeet PRIVATE HAVE_PARAKEET_SIMD)
+endif()
+
 # ---------------------------------------------------------------------------
 # Qwen3-ASR — Qwen/Qwen3-ASR-0.6B (Whisper-style audio encoder + Qwen3 LLM)
 # ---------------------------------------------------------------------------
