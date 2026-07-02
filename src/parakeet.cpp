@@ -50,12 +50,33 @@
 
 #if defined(HAVE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
+#elif defined(HAVE_BLAS)
+#include <cblas.h>
+#endif
+
+// §206: opt-out shared by the Accelerate, BLAS, and SIMD fast paths. When set,
+// every dispatch in parakeet_gemv falls through to the scalar byte-exact
+// reference. Defined unconditionally (not just under a fast-path define) so
+// the SIMD path can also honour it.
 static bool parakeet_use_scalar() {
     static int v = -1;
     if (v < 0)
         v = (getenv("PARAKEET_FORCE_SCALAR") != nullptr) ? 1 : 0;
     return v != 0;
 }
+
+// §206: portable SIMD inner kernels for the predictor + joint matmuls.
+// Preferred over cblas on x86 unless an OpenBLAS/MKL (HAVE_PARAKEET_FAST_BLAS)
+// is linked — the hand-rolled AVX2/FMA kernel beats the Netlib reference BLAS.
+// SSE2 is baseline x86-64; AVX2+FMA selected at runtime via ggml_cpu_has_*.
+// NOTE: SIMD changes the float summation order vs the scalar loop, so the
+// rounded logits differ at the ~1e-6 level — same regime as cblas_sgemv and
+// the existing Accelerate path, and far below the argmax decision margin.
+// Greedy TDT decode therefore emits an identical token stream; the scalar
+// path (PARAKEET_FORCE_SCALAR, or non-x86 with no BLAS) is the bit-identical
+// reference.
+#if defined(__x86_64__) && defined(HAVE_PARAKEET_SIMD)
+#include <immintrin.h>
 #endif
 
 #ifndef M_PI
@@ -212,6 +233,33 @@ struct parakeet_vocab {
     std::unordered_map<std::string, int> token_to_id;
 };
 
+// §206: reusable per-decode workspace. Hoists every std::vector allocation
+// that the TDT/RNNT greedy + beam decode loops used to do on every step
+// (gates, proj_e, logits, mid, pred_buf, embed_buf). Sized lazily on first
+// use from the model hparams; reused across decode calls on the same ctx.
+// ABI-safe: lives inside parakeet_context (not the public struct).
+struct parakeet_decode_workspace {
+    std::vector<float> gates;    // [4*H]            LSTM gate pre-activations
+    std::vector<float> proj_e;   // [joint_hidden]   enc projection (per frame)
+    std::vector<float> logits;   // [vocab_total]    joint output
+    std::vector<float> mid;      // [joint_hidden]   relu(enc_proj + pred_proj)
+    std::vector<float> pred_buf; // [H]              predictor output
+    std::vector<float> embed_buf;// [H]              token embedding scratch
+    bool sized = false;
+
+    void ensure(int H, int joint_hidden, int vocab_total) {
+        if (sized)
+            return;
+        gates.assign(4 * H, 0.0f);
+        proj_e.assign(joint_hidden, 0.0f);
+        logits.assign(vocab_total, 0.0f);
+        mid.assign(joint_hidden, 0.0f);
+        pred_buf.assign(H, 0.0f);
+        embed_buf.assign(H, 0.0f);
+        sized = true;
+    }
+};
+
 struct parakeet_context {
     parakeet_context_params params;
 
@@ -228,6 +276,7 @@ struct parakeet_context {
     // Lazy-initialised on first transcribe call.
     parakeet_predictor_weights pred_w;
     parakeet_joint_weights joint_w;
+    parakeet_decode_workspace decode_ws; // §206 reusable per-step buffers
 
     int n_threads = 4;
 
@@ -966,42 +1015,108 @@ static std::vector<float> tensor_to_f32(ggml_tensor* t) {
     return out;
 }
 
+// §206: row dot-product with portable SIMD. Computes sum(row[k]*vec[k]) for
+// k in [0,n). AVX2+FMA when available (via target attribute so this compiles
+// in a non-AVX2 translation unit and dispatches at runtime), SSE2 baseline,
+// scalar tail. Returns the SAME result up to float reassociation (sub-ULP);
+// the scalar reference path (selected by PARAKEET_FORCE_SCALAR or non-x86)
+// is bit-exact.
+#if defined(__x86_64__) && defined(HAVE_PARAKEET_SIMD)
+// AVX2+FMA variant — target attribute lets it compile without -mavx2 globally.
+__attribute__((target("avx2,fma"))) static void parakeet_gemv_avx2(float* out, const float* A, const float* x, int m,
+                                                                   int n) {
+    for (int i = 0; i < m; i++) {
+        const float* row = A + (size_t)i * n;
+        __m256 vacc = _mm256_setzero_ps();
+        int k = 0;
+        for (; k + 8 <= n; k += 8) {
+            vacc = _mm256_fmadd_ps(_mm256_loadu_ps(row + k), _mm256_loadu_ps(x + k), vacc);
+        }
+        __m128 lo = _mm256_castps256_ps128(vacc);
+        __m128 hi = _mm256_extractf128_ps(vacc, 1);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+        float acc = _mm_cvtss_f32(s);
+        for (; k < n; k++)
+            acc += row[k] * x[k];
+        out[i] += acc;
+    }
+}
+
+// SSE2 baseline variant — all intrinsics below are baseline x86-64.
+static void parakeet_gemv_sse2(float* out, const float* A, const float* x, int m, int n) {
+    for (int i = 0; i < m; i++) {
+        const float* row = A + (size_t)i * n;
+        __m128 vacc = _mm_setzero_ps();
+        int k = 0;
+        for (; k + 4 <= n; k += 4) {
+            vacc = _mm_add_ps(vacc, _mm_mul_ps(_mm_loadu_ps(row + k), _mm_loadu_ps(x + k)));
+        }
+        vacc = _mm_add_ps(vacc, _mm_movehl_ps(vacc, vacc));
+        vacc = _mm_add_ss(vacc, _mm_shuffle_ps(vacc, vacc, 1));
+        float acc = _mm_cvtss_f32(vacc);
+        for (; k < n; k++)
+            acc += row[k] * x[k];
+        out[i] += acc;
+    }
+}
+#endif
+
+// matvec: out[m] += A[m,n] @ x[n]  (A row-major). Dispatch priority:
+//   x86 with SIMD  → AVX2/FMA or SSE2 kernel (faster than reference BLAS;
+//                    OpenBLAS/MKL would beat it, but those are detected and
+//                    linked via HAVE_PARAKEET_FAST_BLAS below).
+//   Apple          → Accelerate (vDSP, always optimal).
+//   other + BLAS   → cblas_sgemv.
+//   fallback       → scalar (the byte-exact reference).
+// PARAKEET_FORCE_SCALAR overrides everything to the scalar reference.
+// Dispatch is decided ONCE per matvec (not per row) to keep the inner loop
+// branch-free.
+static void parakeet_gemv(float* out, const float* A, const float* x, int m, int n) {
+#if defined(__x86_64__) && defined(HAVE_PARAKEET_SIMD)
+    // §206: prefer the hand-rolled AVX2/SSE2 kernel on x86. OpenBLAS/MKL
+    // (HAVE_PARAKEET_FAST_BLAS) wins when present and beats the kernel.
+#if !defined(HAVE_PARAKEET_FAST_BLAS)
+    if (!parakeet_use_scalar()) {
+        if (ggml_cpu_has_avx2() && ggml_cpu_has_fma()) {
+            parakeet_gemv_avx2(out, A, x, m, n);
+            return;
+        }
+        parakeet_gemv_sse2(out, A, x, m, n);
+        return;
+    }
+#endif
+#endif
+#if defined(HAVE_ACCELERATE) || defined(HAVE_BLAS) || defined(HAVE_PARAKEET_FAST_BLAS)
+    if (!parakeet_use_scalar()) {
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, m, n, 1.0f, A, n, x, 1, 1.0f, out, 1);
+        return;
+    }
+#endif
+    for (int i = 0; i < m; i++) {
+        const float* row = A + (size_t)i * n;
+        float s = 0.0f;
+        for (int k = 0; k < n; k++)
+            s += row[k] * x[k];
+        out[i] += s;
+    }
+}
+
 static void lstm_step_layer(const float* x, // [in_dim]
                             const float* w_ih, const float* b_ih, const float* w_hh, const float* b_hh, float* h,
-                            float* c,     // [H]   in/out
-                            float* h_out, // [H]   out
+                            float* c,        // [H]   in/out
+                            float* h_out,    // [H]   out
+                            float* gates,    // [4H] scratch (§206, caller-owned)
                             int in_dim, int H) {
     const int H4 = 4 * H;
-    std::vector<float> gates(H4);
 
     // gates = b_ih + b_hh + w_ih @ x + w_hh @ h
     for (int i = 0; i < H4; i++)
         gates[i] = b_ih[i] + b_hh[i];
 
-#if defined(HAVE_ACCELERATE)
-    if (!parakeet_use_scalar()) {
-        // w_ih[4H, in_dim] @ x[in_dim] and w_hh[4H, H] @ h[H], adding into gates
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, H4, in_dim, 1.0f, w_ih, in_dim, x, 1, 1.0f, gates.data(), 1);
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, H4, H, 1.0f, w_hh, H, h, 1, 1.0f, gates.data(), 1);
-    } else {
-#endif
-        for (int i = 0; i < H4; i++) {
-            const float* row = w_ih + (size_t)i * in_dim;
-            float s = 0.0f;
-            for (int k = 0; k < in_dim; k++)
-                s += row[k] * x[k];
-            gates[i] += s;
-        }
-        for (int i = 0; i < H4; i++) {
-            const float* row = w_hh + (size_t)i * H;
-            float s = 0.0f;
-            for (int k = 0; k < H; k++)
-                s += row[k] * h[k];
-            gates[i] += s;
-        }
-#if defined(HAVE_ACCELERATE)
-    }
-#endif
+    parakeet_gemv(gates, w_ih, x, H4, in_dim);
+    parakeet_gemv(gates, w_hh, h, H4, H);
 
     auto sig = [](float x) { return 1.0f / (1.0f + expf(-x)); };
 
@@ -1016,27 +1131,25 @@ static void lstm_step_layer(const float* x, // [in_dim]
 }
 
 // Run one predictor step:  input token id  →  pred_out [H]
+// §206: all scratch is caller-owned (parakeet_decode_workspace), so this is
+// allocation-free in the steady state.
 static void predictor_step(const parakeet_predictor_weights& W, int token_id, parakeet_lstm_state& state,
-                           std::vector<float>& pred_out) {
+                           float* pred_out, float* gates, float* embed_buf) {
     const int H = W.H;
-    pred_out.assign(H, 0.0f);
 
-    // Embed token
-    std::vector<float> x(W.embed.data() + (size_t)token_id * H, W.embed.data() + (size_t)(token_id + 1) * H);
+    // Embed token (copy into caller-owned buffer — no per-step vector alloc)
+    const float* e = W.embed.data() + (size_t)token_id * H;
+    std::memcpy(embed_buf, e, sizeof(float) * H);
 
     // Layer 0
-    std::vector<float> h0_new(H);
-    lstm_step_layer(x.data(), W.w_ih_0.data(), W.b_ih_0.data(), W.w_hh_0.data(), W.b_hh_0.data(), state.h0.data(),
-                    state.c0.data(), h0_new.data(), H, H);
-    state.h0 = h0_new;
+    lstm_step_layer(embed_buf, W.w_ih_0.data(), W.b_ih_0.data(), W.w_hh_0.data(), W.b_hh_0.data(), state.h0.data(),
+                    state.c0.data(), state.h0.data(), gates, H, H);
 
-    // Layer 1 — input is layer 0's hidden
-    std::vector<float> h1_new(H);
+    // Layer 1 — input is layer 0's hidden (now updated in state.h0)
     lstm_step_layer(state.h0.data(), W.w_ih_1.data(), W.b_ih_1.data(), W.w_hh_1.data(), W.b_hh_1.data(),
-                    state.h1.data(), state.c1.data(), h1_new.data(), H, H);
-    state.h1 = h1_new;
+                    state.h1.data(), state.c1.data(), state.h1.data(), gates, H, H);
 
-    pred_out = state.h1;
+    std::memcpy(pred_out, state.h1.data(), sizeof(float) * H);
 }
 
 // ===========================================================================
@@ -1044,74 +1157,62 @@ static void predictor_step(const parakeet_predictor_weights& W, int token_id, pa
 //
 //   joint_in_e = enc_w @ enc[t]  + enc_b           [joint_hidden]
 //   joint_in_p = pred_w @ pred_u + pred_b          [joint_hidden]
-//   logits     = out_w @ tanh(joint_in_e + joint_in_p) + out_b
+//   logits     = out_w @ relu(joint_in_e + joint_in_p) + out_b
 // Output: [vocab+1+n_dur] (8198 for parakeet-tdt-0.6b-v3)
 // ===========================================================================
 
 // Pre-compute proj_e once per encoder frame so we don't redo it inside the
-// inner predictor loop.
-static void joint_proj_enc(const parakeet_joint_weights& J, const float* enc_t, std::vector<float>& out) {
-    out.assign(J.enc_b.begin(), J.enc_b.end());
-#if defined(HAVE_ACCELERATE)
-    if (!parakeet_use_scalar()) {
-        // enc_w[joint_hidden, d_model] @ enc_t[d_model], adding into out (which holds enc_b)
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, J.joint_hidden, J.d_model, 1.0f, J.enc_w.data(), J.d_model, enc_t, 1,
-                    1.0f, out.data(), 1);
-        return;
-    }
-#endif
-    for (int i = 0; i < J.joint_hidden; i++) {
-        float s = out[i]; // already has enc_b[i]
-        const float* row = J.enc_w.data() + (size_t)i * J.d_model;
-        for (int k = 0; k < J.d_model; k++)
-            s += row[k] * enc_t[k];
-        out[i] = s;
-    }
+// inner predictor loop. §206: out is caller-owned (no per-call alloc).
+static void joint_proj_enc(const parakeet_joint_weights& J, const float* enc_t, float* out) {
+    std::memcpy(out, J.enc_b.data(), sizeof(float) * J.joint_hidden);
+    parakeet_gemv(out, J.enc_w.data(), enc_t, J.joint_hidden, J.d_model);
 }
 
 static void joint_step(const parakeet_joint_weights& J,
                        const float* proj_enc, // [joint_hidden]
                        const float* pred_u,   // [pred_hidden]
-                       std::vector<float>& logits) {
-    std::vector<float> mid(J.joint_hidden);
-#if defined(HAVE_ACCELERATE)
-    if (!parakeet_use_scalar()) {
-        // pred_w[joint_hidden, pred_hidden] @ pred_u + pred_b → mid, then relu(proj_enc + mid)
-        mid.assign(J.pred_b.begin(), J.pred_b.end());
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, J.joint_hidden, J.pred_hidden, 1.0f, J.pred_w.data(), J.pred_hidden,
-                    pred_u, 1, 1.0f, mid.data(), 1);
-        for (int i = 0; i < J.joint_hidden; i++) {
-            float v = proj_enc[i] + mid[i];
-            mid[i] = v > 0.0f ? v : 0.0f;
-        }
-        // out_w[vocab_total, joint_hidden] @ mid + out_b → logits
-        logits.assign(J.out_b.begin(), J.out_b.end());
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, J.vocab_total, J.joint_hidden, 1.0f, J.out_w.data(), J.joint_hidden,
-                    mid.data(), 1, 1.0f, logits.data(), 1);
-    } else {
-#endif
-        for (int i = 0; i < J.joint_hidden; i++) {
-            float s = J.pred_b[i];
-            const float* row = J.pred_w.data() + (size_t)i * J.pred_hidden;
-            for (int k = 0; k < J.pred_hidden; k++)
-                s += row[k] * pred_u[k];
-            // NeMo RNNTJoint uses ReLU (not tanh) — see jointnet.activation in
-            // model_config.yaml.
-            float v = proj_enc[i] + s;
-            mid[i] = v > 0.0f ? v : 0.0f;
-        }
-
-        logits.assign(J.vocab_total, 0.0f);
-        for (int v = 0; v < J.vocab_total; v++) {
-            float s = J.out_b[v];
-            const float* row = J.out_w.data() + (size_t)v * J.joint_hidden;
-            for (int k = 0; k < J.joint_hidden; k++)
-                s += row[k] * mid[k];
-            logits[v] = s;
-        }
-#if defined(HAVE_ACCELERATE)
+                       float* logits,         // [vocab_total] out
+                       float* mid) {          // [joint_hidden] scratch (§206)
+    // mid = pred_b + pred_w @ pred_u
+    std::memcpy(mid, J.pred_b.data(), sizeof(float) * J.joint_hidden);
+    parakeet_gemv(mid, J.pred_w.data(), pred_u, J.joint_hidden, J.pred_hidden);
+    // relu(proj_enc + mid) in place
+    for (int i = 0; i < J.joint_hidden; i++) {
+        float v = proj_enc[i] + mid[i];
+        mid[i] = v > 0.0f ? v : 0.0f;
     }
-#endif
+    // logits = out_b + out_w @ mid
+    std::memcpy(logits, J.out_b.data(), sizeof(float) * J.vocab_total);
+    parakeet_gemv(logits, J.out_w.data(), mid, J.vocab_total, J.joint_hidden);
+}
+
+// §206 std::vector overloads — kept for the beam/MAES/CTC paths where each
+// hypothesis owns its own pred_out/logits vectors. The greedy hot path (the
+// decode-time bottleneck) uses the pointer + workspace variants above.
+static void predictor_step(const parakeet_predictor_weights& W, int token_id, parakeet_lstm_state& state,
+                           std::vector<float>& pred_out) {
+    static thread_local std::vector<float> gates, embed;
+    const int H = W.H;
+    if ((int)gates.size() < 4 * H)
+        gates.assign(4 * H, 0.0f);
+    if ((int)embed.size() < H)
+        embed.assign(H, 0.0f);
+    pred_out.resize(H);
+    predictor_step(W, token_id, state, pred_out.data(), gates.data(), embed.data());
+}
+
+static void joint_proj_enc(const parakeet_joint_weights& J, const float* enc_t, std::vector<float>& out) {
+    out.resize(J.joint_hidden);
+    joint_proj_enc(J, enc_t, out.data());
+}
+
+static void joint_step(const parakeet_joint_weights& J, const float* proj_enc, const float* pred_u,
+                       std::vector<float>& logits) {
+    static thread_local std::vector<float> mid;
+    if ((int)mid.size() < J.joint_hidden)
+        mid.assign(J.joint_hidden, 0.0f);
+    logits.resize(J.vocab_total);
+    joint_step(J, proj_enc, pred_u, logits.data(), mid.data());
 }
 
 // ===========================================================================
@@ -1256,34 +1357,41 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
     std::vector<parakeet_emitted_token> emitted;
     emitted.reserve(256);
 
+    // §206: reusable per-step scratch, owned by the context. Sized once and
+    // reused across every greedy decode on this ctx — no per-step heap allocs.
+    auto& ws = ctx->decode_ws;
+    ws.ensure(W.H, J.joint_hidden, J.vocab_total);
+    float* gates = ws.gates.data();
+    float* embed_buf = ws.embed_buf.data();
+    float* pred_out = ws.pred_buf.data();
+    float* proj_e = ws.proj_e.data();
+    float* logits = ws.logits.data();
+    float* mid = ws.mid.data();
+
     parakeet_lstm_state state;
     lstm_init_state(state, W.H);
 
     // SOS / first input is the blank token (NeMo convention)
-    std::vector<float> pred_out;
-    predictor_step(W, blank_id, state, pred_out);
+    predictor_step(W, blank_id, state, pred_out, gates, embed_buf);
     if (getenv("PARAKEET_DEBUG"))
         fprintf(
             stderr, "parakeet: pred_out[blank]: mean=%.4f std=%.4f [0..3]=%.4f %.4f %.4f %.4f\n",
             [&] {
                 double s = 0;
-                for (auto v : pred_out)
-                    s += v;
-                return s / pred_out.size();
+                for (int i = 0; i < W.H; i++)
+                    s += pred_out[i];
+                return s / W.H;
             }(),
             [&] {
                 double s = 0, m = 0;
-                for (auto v : pred_out) {
-                    m += v;
-                    s += v * v;
+                for (int i = 0; i < W.H; i++) {
+                    m += pred_out[i];
+                    s += pred_out[i] * pred_out[i];
                 }
-                m /= pred_out.size();
-                return sqrt(s / pred_out.size() - m * m);
+                m /= W.H;
+                return sqrt(s / W.H - m * m);
             }(),
             (double)pred_out[0], (double)pred_out[1], (double)pred_out[2], (double)pred_out[3]);
-
-    std::vector<float> proj_e(J.joint_hidden);
-    std::vector<float> logits(J.vocab_total);
 
     // Sampling state — only touched when ctx->decode_temperature > 0.
     // We initialize unconditionally because seeding a mt19937_64 is
@@ -1302,11 +1410,11 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
 
         int n_inner = 0;
         while (n_inner < max_per_step) {
-            joint_step(J, proj_e.data(), pred_out.data(), logits);
+            joint_step(J, proj_e, pred_out, logits, mid);
 
             // CTC-WS phrase boost on vocab logits (not duration logits)
             if (has_hotwords)
-                core_context_bias::apply_bias(ctx->hotword_trie, hw_state, logits.data(), n_vocab_blk,
+                core_context_bias::apply_bias(ctx->hotword_trie, hw_state, logits, n_vocab_blk,
                                               ctx->hotword_boost);
 
             if (getenv("PARAKEET_DEBUG") && total_steps < 5) {
@@ -1418,14 +1526,15 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
             emitted.push_back({tok, t, t_end, tok_p});
             if (has_hotwords)
                 core_context_bias::advance(ctx->hotword_trie, hw_state, tok);
-            predictor_step(W, tok, state, pred_out);
+            predictor_step(W, tok, state, pred_out, gates, embed_buf);
 
             // Diagnostic: dump predictor stats for the first few emissions
             // so we can compare with NeMo step-by-step (not just SOS).
             if (getenv("PARAKEET_DEBUG") && (int)emitted.size() <= 5) {
                 double s = 0, m = 0;
                 float minv = pred_out[0], maxv = pred_out[0];
-                for (auto v : pred_out) {
+                for (int i = 0; i < W.H; i++) {
+                    float v = pred_out[i];
                     m += v;
                     s += v * v;
                     if (v < minv)
@@ -1433,8 +1542,8 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
                     if (v > maxv)
                         maxv = v;
                 }
-                m /= pred_out.size();
-                double std_ = sqrt(s / pred_out.size() - m * m);
+                m /= W.H;
+                double std_ = sqrt(s / W.H - m * m);
                 fprintf(stderr,
                         "parakeet: emit#%zu tok=%d dur=%d  pred_out: mean=%.4f std=%.4f "
                         "min=%.3f max=%.3f [0..3]=%.3f %.3f %.3f %.3f\n",
