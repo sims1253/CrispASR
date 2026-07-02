@@ -910,16 +910,10 @@ if(APPLE)
     target_compile_definitions(parakeet PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
 endif()
 
-# §223: cblas_sgemv for the TDT predictor LSTM + joint head decode hot path.
-# Mirrors the mel/cohere CBLAS wiring (§176f): the predictor does two
-# (4H x H) gemv's per step and the joint head does a (vocab_total x
-# joint_hidden) gemv per step — both dominate decode time on CPU.
-#
-# IMPORTANT: only OpenBLAS/MKL actually beat the hand-rolled AVX2/SSE2 kernel
-# (§223). The Netlib reference BLAS (libblas.so) is *slower* than the kernel,
-# so we define HAVE_PARAKEET_FAST_BLAS ONLY when OpenBLAS or MKL is detected;
-# reference BLAS is left unlinked so the SIMD kernel is used instead. The
-# scalar path stays the byte-exact reference (PARAKEET_FORCE_SCALAR or no SIMD).
+# §223 cblas_sgemv for the TDT predictor + joint head gemv's. Only OpenBLAS/MKL
+# beat the hand-rolled AVX2/SSE2 kernel — the Netlib reference BLAS is slower —
+# so HAVE_PARAKEET_FAST_BLAS is defined only for those. Reference BLAS is left
+# unlinked so the SIMD kernel is used instead.
 option(CRISPASR_PARAKEET_BLAS "Use cblas_sgemv for the parakeet TDT predictor + joint head (§223)" ON)
 if(CRISPASR_PARAKEET_BLAS AND NOT APPLE AND NOT MSVC)
     find_library(OPENBLAS_LIB openblas)
@@ -940,14 +934,10 @@ if(CRISPASR_PARAKEET_BLAS AND NOT APPLE AND NOT MSVC)
         target_compile_definitions(parakeet PRIVATE HAVE_BLAS HAVE_PARAKEET_FAST_BLAS)
         message(STATUS "parakeet: linking MKL (fast) for TDT decode gemv")
     endif()
-    # Reference BLAS deliberately NOT linked — the SIMD kernel beats it.
 endif()
 
-# §223: portable SIMD matmul for the predictor + joint hot path. SSE2 is
-# baseline x86-64; AVX2/FMA is detected at runtime via ggml's cpu caps so the
-# scalar byte-exact reference stays the fallback. Always compiled on x86-64
-# (guarded by __x86_64__); the dispatch in parakeet_gemv prefers it over the
-# reference BLAS, and uses OpenBLAS/MKL only when HAVE_PARAKEET_FAST_BLAS.
+# §223 portable SIMD gemv: SSE2 baseline, AVX2/FMA runtime-detected. Preferred
+# over reference BLAS on x86-64; OpenBLAS/MKL take priority when linked above.
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64)")
     target_compile_definitions(parakeet PRIVATE HAVE_PARAKEET_SIMD)
 endif()

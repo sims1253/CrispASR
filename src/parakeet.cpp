@@ -54,10 +54,7 @@
 #include <cblas.h>
 #endif
 
-// §223: opt-out shared by the Accelerate, BLAS, and SIMD fast paths. When set,
-// every dispatch in parakeet_gemv falls through to the scalar byte-exact
-// reference. Defined unconditionally (not just under a fast-path define) so
-// the SIMD path can also honour it.
+// Forces parakeet_gemv onto the bit-identical scalar reference.
 static bool parakeet_use_scalar() {
     static int v = -1;
     if (v < 0)
@@ -65,16 +62,12 @@ static bool parakeet_use_scalar() {
     return v != 0;
 }
 
-// §223: portable SIMD inner kernels for the predictor + joint matmuls.
-// Preferred over cblas on x86 unless an OpenBLAS/MKL (HAVE_PARAKEET_FAST_BLAS)
-// is linked — the hand-rolled AVX2/FMA kernel beats the Netlib reference BLAS.
-// SSE2 is baseline x86-64; AVX2+FMA selected at runtime via ggml_cpu_has_*.
-// NOTE: SIMD changes the float summation order vs the scalar loop, so the
-// rounded logits differ at the ~1e-6 level — same regime as cblas_sgemv and
-// the existing Accelerate path, and far below the argmax decision margin.
-// Greedy TDT decode therefore emits an identical token stream; the scalar
-// path (PARAKEET_FORCE_SCALAR, or non-x86 with no BLAS) is the bit-identical
-// reference.
+// §223 portable SIMD gemv kernels for the predictor + joint matmuls. AVX2+FMA
+// (runtime-detected) or SSE2 baseline; preferred over cblas on x86 since the
+// Netlib reference BLAS is slower than this kernel (only OpenBLAS/MKL beat it,
+// linked via HAVE_PARAKEET_FAST_BLAS). SIMD reorders the float sum (~1e-6, same
+// regime as cblas_sgemv) — below the greedy-argmax margin, so the emitted token
+// stream is unchanged; the scalar path stays the bit-identical reference.
 #if defined(__x86_64__) && defined(HAVE_PARAKEET_SIMD)
 #include <immintrin.h>
 #endif
@@ -233,11 +226,8 @@ struct parakeet_vocab {
     std::unordered_map<std::string, int> token_to_id;
 };
 
-// §223: reusable per-decode workspace. Hoists every std::vector allocation
-// that the TDT/RNNT greedy + beam decode loops used to do on every step
-// (gates, proj_e, logits, mid, pred_buf, embed_buf). Sized lazily on first
-// use from the model hparams; reused across decode calls on the same ctx.
-// ABI-safe: lives inside parakeet_context (not the public struct).
+// §223 reusable per-decode scratch — sized once, reused across decode calls.
+// ABI-safe (internal to parakeet_context).
 struct parakeet_decode_workspace {
     std::vector<float> gates;    // [4*H]            LSTM gate pre-activations
     std::vector<float> proj_e;   // [joint_hidden]   enc projection (per frame)
@@ -276,7 +266,7 @@ struct parakeet_context {
     // Lazy-initialised on first transcribe call.
     parakeet_predictor_weights pred_w;
     parakeet_joint_weights joint_w;
-    parakeet_decode_workspace decode_ws; // §223 reusable per-step buffers
+    parakeet_decode_workspace decode_ws; // §223 reusable per-step scratch
 
     int n_threads = 4;
 
@@ -1015,12 +1005,8 @@ static std::vector<float> tensor_to_f32(ggml_tensor* t) {
     return out;
 }
 
-// §223: row dot-product with portable SIMD. Computes sum(row[k]*vec[k]) for
-// k in [0,n). AVX2+FMA when available (via target attribute so this compiles
-// in a non-AVX2 translation unit and dispatches at runtime), SSE2 baseline,
-// scalar tail. Returns the SAME result up to float reassociation (sub-ULP);
-// the scalar reference path (selected by PARAKEET_FORCE_SCALAR or non-x86)
-// is bit-exact.
+// §223 row dot-product with portable SIMD. AVX2+FMA via target attribute
+// (compiles in a non-AVX2 TU, dispatches at runtime), else SSE2, scalar tail.
 #if defined(__x86_64__) && defined(HAVE_PARAKEET_SIMD)
 // AVX2+FMA variant — target attribute lets it compile without -mavx2 globally.
 __attribute__((target("avx2,fma"))) static void parakeet_gemv_avx2(float* out, const float* A, const float* x, int m,
@@ -1063,20 +1049,11 @@ static void parakeet_gemv_sse2(float* out, const float* A, const float* x, int m
 }
 #endif
 
-// matvec: out[m] += A[m,n] @ x[n]  (A row-major). Dispatch priority:
-//   x86 with SIMD  → AVX2/FMA or SSE2 kernel (faster than reference BLAS;
-//                    OpenBLAS/MKL would beat it, but those are detected and
-//                    linked via HAVE_PARAKEET_FAST_BLAS below).
-//   Apple          → Accelerate (vDSP, always optimal).
-//   other + BLAS   → cblas_sgemv.
-//   fallback       → scalar (the byte-exact reference).
-// PARAKEET_FORCE_SCALAR overrides everything to the scalar reference.
-// Dispatch is decided ONCE per matvec (not per row) to keep the inner loop
-// branch-free.
+// out[m] += A[m,n] @ x[n]  (A row-major). Dispatch (§223): x86+SIMD → AVX2/SSE2
+// kernel unless an OpenBLAS/MKL fast BLAS is linked; Apple → Accelerate;
+// otherwise scalar. PARAKEET_FORCE_SCALAR forces the scalar reference.
 static void parakeet_gemv(float* out, const float* A, const float* x, int m, int n) {
 #if defined(__x86_64__) && defined(HAVE_PARAKEET_SIMD)
-    // §223: prefer the hand-rolled AVX2/SSE2 kernel on x86. OpenBLAS/MKL
-    // (HAVE_PARAKEET_FAST_BLAS) wins when present and beats the kernel.
 #if !defined(HAVE_PARAKEET_FAST_BLAS)
     if (!parakeet_use_scalar()) {
         if (ggml_cpu_has_avx2() && ggml_cpu_has_fma()) {
@@ -1107,7 +1084,7 @@ static void lstm_step_layer(const float* x, // [in_dim]
                             const float* w_ih, const float* b_ih, const float* w_hh, const float* b_hh, float* h,
                             float* c,        // [H]   in/out
                             float* h_out,    // [H]   out
-                            float* gates,    // [4H] scratch (§223, caller-owned)
+                            float* gates,    // [4H] caller scratch
                             int in_dim, int H) {
     const int H4 = 4 * H;
 
@@ -1131,21 +1108,19 @@ static void lstm_step_layer(const float* x, // [in_dim]
 }
 
 // Run one predictor step:  input token id  →  pred_out [H]
-// §223: all scratch is caller-owned (parakeet_decode_workspace), so this is
-// allocation-free in the steady state.
+// Scratch is caller-owned (parakeet_decode_workspace in the greedy path).
 static void predictor_step(const parakeet_predictor_weights& W, int token_id, parakeet_lstm_state& state,
                            float* pred_out, float* gates, float* embed_buf) {
     const int H = W.H;
 
-    // Embed token (copy into caller-owned buffer — no per-step vector alloc)
-    const float* e = W.embed.data() + (size_t)token_id * H;
-    std::memcpy(embed_buf, e, sizeof(float) * H);
+    // Embed token
+    std::memcpy(embed_buf, W.embed.data() + (size_t)token_id * H, sizeof(float) * H);
 
     // Layer 0
     lstm_step_layer(embed_buf, W.w_ih_0.data(), W.b_ih_0.data(), W.w_hh_0.data(), W.b_hh_0.data(), state.h0.data(),
                     state.c0.data(), state.h0.data(), gates, H, H);
 
-    // Layer 1 — input is layer 0's hidden (now updated in state.h0)
+    // Layer 1 — input is layer 0's hidden (now in state.h0)
     lstm_step_layer(state.h0.data(), W.w_ih_1.data(), W.b_ih_1.data(), W.w_hh_1.data(), W.b_hh_1.data(),
                     state.h1.data(), state.c1.data(), state.h1.data(), gates, H, H);
 
@@ -1162,7 +1137,7 @@ static void predictor_step(const parakeet_predictor_weights& W, int token_id, pa
 // ===========================================================================
 
 // Pre-compute proj_e once per encoder frame so we don't redo it inside the
-// inner predictor loop. §223: out is caller-owned (no per-call alloc).
+// inner predictor loop.
 static void joint_proj_enc(const parakeet_joint_weights& J, const float* enc_t, float* out) {
     std::memcpy(out, J.enc_b.data(), sizeof(float) * J.joint_hidden);
     parakeet_gemv(out, J.enc_w.data(), enc_t, J.joint_hidden, J.d_model);
@@ -1172,7 +1147,7 @@ static void joint_step(const parakeet_joint_weights& J,
                        const float* proj_enc, // [joint_hidden]
                        const float* pred_u,   // [pred_hidden]
                        float* logits,         // [vocab_total] out
-                       float* mid) {          // [joint_hidden] scratch (§223)
+                       float* mid) {          // [joint_hidden] scratch
     // mid = pred_b + pred_w @ pred_u
     std::memcpy(mid, J.pred_b.data(), sizeof(float) * J.joint_hidden);
     parakeet_gemv(mid, J.pred_w.data(), pred_u, J.joint_hidden, J.pred_hidden);
@@ -1186,9 +1161,8 @@ static void joint_step(const parakeet_joint_weights& J,
     parakeet_gemv(logits, J.out_w.data(), mid, J.vocab_total, J.joint_hidden);
 }
 
-// §223 std::vector overloads — kept for the beam/MAES/CTC paths where each
-// hypothesis owns its own pred_out/logits vectors. The greedy hot path (the
-// decode-time bottleneck) uses the pointer + workspace variants above.
+// std::vector overloads for the beam/MAES/CTC paths (each hypothesis owns its
+// own pred_out/logits). The greedy hot path uses the pointer variants above.
 static void predictor_step(const parakeet_predictor_weights& W, int token_id, parakeet_lstm_state& state,
                            std::vector<float>& pred_out) {
     static thread_local std::vector<float> gates, embed;
@@ -1357,8 +1331,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
     std::vector<parakeet_emitted_token> emitted;
     emitted.reserve(256);
 
-    // §223: reusable per-step scratch, owned by the context. Sized once and
-    // reused across every greedy decode on this ctx — no per-step heap allocs.
+    // Reusable per-step scratch (§223) — no per-step heap allocs.
     auto& ws = ctx->decode_ws;
     ws.ensure(W.H, J.joint_hidden, J.vocab_total);
     float* gates = ws.gates.data();
