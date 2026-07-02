@@ -54,7 +54,7 @@
 #include <cblas.h>
 #endif
 
-// §206: opt-out shared by the Accelerate, BLAS, and SIMD fast paths. When set,
+// §223: opt-out shared by the Accelerate, BLAS, and SIMD fast paths. When set,
 // every dispatch in parakeet_gemv falls through to the scalar byte-exact
 // reference. Defined unconditionally (not just under a fast-path define) so
 // the SIMD path can also honour it.
@@ -65,7 +65,7 @@ static bool parakeet_use_scalar() {
     return v != 0;
 }
 
-// §206: portable SIMD inner kernels for the predictor + joint matmuls.
+// §223: portable SIMD inner kernels for the predictor + joint matmuls.
 // Preferred over cblas on x86 unless an OpenBLAS/MKL (HAVE_PARAKEET_FAST_BLAS)
 // is linked — the hand-rolled AVX2/FMA kernel beats the Netlib reference BLAS.
 // SSE2 is baseline x86-64; AVX2+FMA selected at runtime via ggml_cpu_has_*.
@@ -233,7 +233,7 @@ struct parakeet_vocab {
     std::unordered_map<std::string, int> token_to_id;
 };
 
-// §206: reusable per-decode workspace. Hoists every std::vector allocation
+// §223: reusable per-decode workspace. Hoists every std::vector allocation
 // that the TDT/RNNT greedy + beam decode loops used to do on every step
 // (gates, proj_e, logits, mid, pred_buf, embed_buf). Sized lazily on first
 // use from the model hparams; reused across decode calls on the same ctx.
@@ -276,7 +276,7 @@ struct parakeet_context {
     // Lazy-initialised on first transcribe call.
     parakeet_predictor_weights pred_w;
     parakeet_joint_weights joint_w;
-    parakeet_decode_workspace decode_ws; // §206 reusable per-step buffers
+    parakeet_decode_workspace decode_ws; // §223 reusable per-step buffers
 
     int n_threads = 4;
 
@@ -1015,7 +1015,7 @@ static std::vector<float> tensor_to_f32(ggml_tensor* t) {
     return out;
 }
 
-// §206: row dot-product with portable SIMD. Computes sum(row[k]*vec[k]) for
+// §223: row dot-product with portable SIMD. Computes sum(row[k]*vec[k]) for
 // k in [0,n). AVX2+FMA when available (via target attribute so this compiles
 // in a non-AVX2 translation unit and dispatches at runtime), SSE2 baseline,
 // scalar tail. Returns the SAME result up to float reassociation (sub-ULP);
@@ -1075,7 +1075,7 @@ static void parakeet_gemv_sse2(float* out, const float* A, const float* x, int m
 // branch-free.
 static void parakeet_gemv(float* out, const float* A, const float* x, int m, int n) {
 #if defined(__x86_64__) && defined(HAVE_PARAKEET_SIMD)
-    // §206: prefer the hand-rolled AVX2/SSE2 kernel on x86. OpenBLAS/MKL
+    // §223: prefer the hand-rolled AVX2/SSE2 kernel on x86. OpenBLAS/MKL
     // (HAVE_PARAKEET_FAST_BLAS) wins when present and beats the kernel.
 #if !defined(HAVE_PARAKEET_FAST_BLAS)
     if (!parakeet_use_scalar()) {
@@ -1107,7 +1107,7 @@ static void lstm_step_layer(const float* x, // [in_dim]
                             const float* w_ih, const float* b_ih, const float* w_hh, const float* b_hh, float* h,
                             float* c,        // [H]   in/out
                             float* h_out,    // [H]   out
-                            float* gates,    // [4H] scratch (§206, caller-owned)
+                            float* gates,    // [4H] scratch (§223, caller-owned)
                             int in_dim, int H) {
     const int H4 = 4 * H;
 
@@ -1131,7 +1131,7 @@ static void lstm_step_layer(const float* x, // [in_dim]
 }
 
 // Run one predictor step:  input token id  →  pred_out [H]
-// §206: all scratch is caller-owned (parakeet_decode_workspace), so this is
+// §223: all scratch is caller-owned (parakeet_decode_workspace), so this is
 // allocation-free in the steady state.
 static void predictor_step(const parakeet_predictor_weights& W, int token_id, parakeet_lstm_state& state,
                            float* pred_out, float* gates, float* embed_buf) {
@@ -1162,7 +1162,7 @@ static void predictor_step(const parakeet_predictor_weights& W, int token_id, pa
 // ===========================================================================
 
 // Pre-compute proj_e once per encoder frame so we don't redo it inside the
-// inner predictor loop. §206: out is caller-owned (no per-call alloc).
+// inner predictor loop. §223: out is caller-owned (no per-call alloc).
 static void joint_proj_enc(const parakeet_joint_weights& J, const float* enc_t, float* out) {
     std::memcpy(out, J.enc_b.data(), sizeof(float) * J.joint_hidden);
     parakeet_gemv(out, J.enc_w.data(), enc_t, J.joint_hidden, J.d_model);
@@ -1172,7 +1172,7 @@ static void joint_step(const parakeet_joint_weights& J,
                        const float* proj_enc, // [joint_hidden]
                        const float* pred_u,   // [pred_hidden]
                        float* logits,         // [vocab_total] out
-                       float* mid) {          // [joint_hidden] scratch (§206)
+                       float* mid) {          // [joint_hidden] scratch (§223)
     // mid = pred_b + pred_w @ pred_u
     std::memcpy(mid, J.pred_b.data(), sizeof(float) * J.joint_hidden);
     parakeet_gemv(mid, J.pred_w.data(), pred_u, J.joint_hidden, J.pred_hidden);
@@ -1186,7 +1186,7 @@ static void joint_step(const parakeet_joint_weights& J,
     parakeet_gemv(logits, J.out_w.data(), mid, J.vocab_total, J.joint_hidden);
 }
 
-// §206 std::vector overloads — kept for the beam/MAES/CTC paths where each
+// §223 std::vector overloads — kept for the beam/MAES/CTC paths where each
 // hypothesis owns its own pred_out/logits vectors. The greedy hot path (the
 // decode-time bottleneck) uses the pointer + workspace variants above.
 static void predictor_step(const parakeet_predictor_weights& W, int token_id, parakeet_lstm_state& state,
@@ -1357,7 +1357,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
     std::vector<parakeet_emitted_token> emitted;
     emitted.reserve(256);
 
-    // §206: reusable per-step scratch, owned by the context. Sized once and
+    // §223: reusable per-step scratch, owned by the context. Sized once and
     // reused across every greedy decode on this ctx — no per-step heap allocs.
     auto& ws = ctx->decode_ws;
     ws.ensure(W.H, J.joint_hidden, J.vocab_total);

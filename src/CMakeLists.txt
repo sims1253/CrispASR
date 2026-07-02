@@ -910,17 +910,17 @@ if(APPLE)
     target_compile_definitions(parakeet PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
 endif()
 
-# §206: cblas_sgemv for the TDT predictor LSTM + joint head decode hot path.
+# §223: cblas_sgemv for the TDT predictor LSTM + joint head decode hot path.
 # Mirrors the mel/cohere CBLAS wiring (§176f): the predictor does two
 # (4H x H) gemv's per step and the joint head does a (vocab_total x
 # joint_hidden) gemv per step — both dominate decode time on CPU.
 #
 # IMPORTANT: only OpenBLAS/MKL actually beat the hand-rolled AVX2/SSE2 kernel
-# (§206). The Netlib reference BLAS (libblas.so) is *slower* than the kernel,
+# (§223). The Netlib reference BLAS (libblas.so) is *slower* than the kernel,
 # so we define HAVE_PARAKEET_FAST_BLAS ONLY when OpenBLAS or MKL is detected;
 # reference BLAS is left unlinked so the SIMD kernel is used instead. The
 # scalar path stays the byte-exact reference (PARAKEET_FORCE_SCALAR or no SIMD).
-option(CRISPASR_PARAKEET_BLAS "Use cblas_sgemv for the parakeet TDT predictor + joint head (§206)" ON)
+option(CRISPASR_PARAKEET_BLAS "Use cblas_sgemv for the parakeet TDT predictor + joint head (§223)" ON)
 if(CRISPASR_PARAKEET_BLAS AND NOT APPLE AND NOT MSVC)
     find_library(OPENBLAS_LIB openblas)
     find_library(MKL_RT NAMES mkl_rt mkl_rt.so)
@@ -943,7 +943,7 @@ if(CRISPASR_PARAKEET_BLAS AND NOT APPLE AND NOT MSVC)
     # Reference BLAS deliberately NOT linked — the SIMD kernel beats it.
 endif()
 
-# §206: portable SIMD matmul for the predictor + joint hot path. SSE2 is
+# §223: portable SIMD matmul for the predictor + joint hot path. SSE2 is
 # baseline x86-64; AVX2/FMA is detected at runtime via ggml's cpu caps so the
 # scalar byte-exact reference stays the fallback. Always compiled on x86-64
 # (guarded by __x86_64__); the dispatch in parakeet_gemv prefers it over the

@@ -10,6 +10,17 @@ effort estimate. Completed items have been moved to `HISTORY.md`.
 
 **Latest release: v0.6.12** (commit `345ecfdc`). Full notes in [`RELEASE_NOTES_v0.6.12.md`](RELEASE_NOTES_v0.6.12.md).
 
+## Parakeet TDT decode CPU hot-path optimization (DONE — §223)
+
+The parakeet-tdt-0.6b-v3 predictor LSTM + joint head decode loop was scalar
+C++ with per-step `std::vector` allocations — 93 % of decode time on CPU
+(446 ms / 0.8 s jfk). Optimized via a reusable decode workspace (zero per-step
+alloc) and a hand-rolled AVX2/FMA + SSE2 gemv kernel with runtime dispatch.
+2.6× decode speedup (446 → 170 ms), end-to-end 13.8× → 37.0× realtime,
+transcript byte-identical. BLAS (OpenBLAS/MKL) auto-linked when present and
+faster than the kernel; scalar reference kept behind `PARAKEET_FORCE_SCALAR`.
+Full writeup in HISTORY §223 / LEARNINGS §223.
+
 ## Gemma-4 12B (gemma4_unified) ASR support (OPEN)
 
 The remaining open item for full 12B support (a new converter map + backend audio path for the 640-dim unified
