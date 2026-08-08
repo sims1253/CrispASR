@@ -28,6 +28,7 @@
 #include <climits>
 #include <cmath>
 #include <limits>
+#include <memory> // std::unique_ptr for §replay encoder/adapter graph caches
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,6 +48,7 @@
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/ngram_loop_fix.h"   // core_ngram::fix_loops (issue #218)
 #include "core/crispasr_env.h"
+#include "core/replay_graph.h" // §replay allocate-once/compute-many encoder + adapter graphs
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -230,6 +232,16 @@ struct moss_transcribe_context {
     ggml_cgraph* cached_conv_gf = nullptr;
     ggml_context* cached_conv_ctx = nullptr;
     std::vector<uint8_t> cached_conv_meta;
+
+    // §replay: allocate-once/compute-many encoder-xf + adapter graphs (portable
+    // CUDAGraph-equivalent). nullptr until the first replay-path run of a given
+    // T_enc; rebuilt only when T_enc changes. Each owns its own private gallocr
+    // + persistent context, so reusing across calls is safe (no stale buffer
+    // pointers). Gated by CRISPASR_MOSS_TRANSCRIBE_REPLAY.
+    std::unique_ptr<core_replay::ReplayGraph> enc_xf_replay;
+    std::unique_ptr<core_replay::ReplayGraph> adapter_replay;
+    int enc_xf_replay_T_enc = 0;
+    int adapter_replay_T_enc = 0;
 
     int n_threads = 4;
     std::string model_path;
@@ -652,7 +664,28 @@ static ggml_cgraph* moss_transcribe_build_conv_graph(moss_transcribe_context* ct
 // full concatenated sequence with a block-diagonal windowed attention mask.
 // ===========================================================================
 
+// Forward decls: the public build_* helpers delegate to _into variants that
+// build the forward in a caller-supplied context, so the legacy per-call
+// rebuild and the §replay allocate-once path share the byte-identical builder.
+static ggml_cgraph* moss_transcribe_build_encoder_xf_graph_into(moss_transcribe_context* ctx, ggml_context* ctx0,
+                                                                int T_enc);
+static ggml_cgraph* moss_transcribe_build_adapter_graph_into(moss_transcribe_context* ctx, ggml_context* ctx0,
+                                                             int T_enc);
+
 static ggml_cgraph* moss_transcribe_build_encoder_xf_graph(moss_transcribe_context* ctx, int T_enc) {
+    struct ggml_init_params gparams = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(gparams);
+    ggml_cgraph* gf = moss_transcribe_build_encoder_xf_graph_into(ctx, ctx0, T_enc);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Core encoder-xf builder: constructs the forward in the GIVEN context (the
+// legacy per-call rebuild uses ctx->compute_meta; the §replay path uses a
+// ReplayGraph's persistent arena). Split out so both paths build the
+// byte-identical graph. Forward decl above.
+static ggml_cgraph* moss_transcribe_build_encoder_xf_graph_into(moss_transcribe_context* ctx, ggml_context* ctx0,
+                                                                int T_enc) {
     const auto& hp = ctx->model.hparams;
     const auto& enc = ctx->model.enc;
     const int d = (int)hp.enc_d_model;
@@ -660,8 +693,6 @@ static ggml_cgraph* moss_transcribe_build_encoder_xf_graph(moss_transcribe_conte
     const int head_dim = (int)hp.enc_head_dim;
     const int out_dim = (int)hp.enc_output_dim;
 
-    struct ggml_init_params gparams = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(gparams);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // Input: hidden states (d, T_enc), conv_out + pos already applied on host.
@@ -842,6 +873,72 @@ extern "C" float* moss_transcribe_run_encoder(struct moss_transcribe_context* ct
     // ---- 2. Transformer over full sequence with block-diagonal windows ----
     // window_aftercnn = T_chunk_down * (n_window_infer / (2*n_window)).
     const int win = T_chunk_down * ((int)hp.n_window_infer / chunk_T);
+
+    // §replay: allocate-once/compute-many encoder-xf path. Builds the graph
+    // ONCE per T_enc into a ReplayGraph (private gallocr + stable uid →
+    // CUDA-graph capture), then replays it every call with fresh inputs. Gated
+    // by CRISPASR_MOSS_TRANSCRIBE_REPLAY; default is the legacy rebuild path.
+    if (crispasr_env::truthy("CRISPASR_MOSS_TRANSCRIBE_REPLAY")) {
+        if (!ctx->enc_xf_replay || ctx->enc_xf_replay_T_enc != T_enc) {
+            ctx->enc_xf_replay =
+                std::make_unique<core_replay::ReplayGraph>(ctx->backend, ctx->backend_cpu, 16384, [&](ggml_context* c) {
+                    return moss_transcribe_build_encoder_xf_graph_into(ctx, c, T_enc);
+                });
+            ctx->enc_xf_replay_T_enc = T_enc;
+            if (!ctx->enc_xf_replay->graph()) {
+                fprintf(stderr, "moss_transcribe: failed to build replay encoder xf graph\n");
+                return nullptr;
+            }
+        }
+        ggml_cgraph* rgf = ctx->enc_xf_replay->graph();
+        core_replay::set_named(rgf, "xf_input", hidden.data(), (size_t)d * T_enc * sizeof(float));
+        // Block-diagonal mask: window blocks of `win` frames, bidirectional within.
+        {
+            std::vector<ggml_fp16_t> mask((size_t)T_enc * T_enc);
+            const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
+            std::vector<int> block_of(T_enc);
+            for (int i = 0; i < T_enc; i++)
+                block_of[i] = (win > 0) ? (i / win) : 0;
+            for (int q = 0; q < T_enc; q++)
+                for (int k = 0; k < T_enc; k++)
+                    mask[(size_t)q * T_enc + k] = (block_of[q] == block_of[k]) ? zero_h : ninf_h;
+            core_replay::set_named(rgf, "attn_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t));
+        }
+        if (!ctx->enc_xf_replay->replay()) {
+            fprintf(stderr, "moss_transcribe: replay encoder xf compute failed\n");
+            return nullptr;
+        }
+        float* result = (float*)malloc((size_t)out_dim * T_enc * sizeof(float));
+        core_replay::read_named(rgf, "encoder_output", result, (size_t)out_dim * T_enc * sizeof(float));
+        if (const char* dp = crispasr_env::get("CRISPASR_MOSS_TRANSCRIBE_L0_DUMP")) {
+            ggml_tensor* l0 = ggml_graph_get_tensor(rgf, "enc_layer_0");
+            if (l0) {
+                std::vector<float> b((size_t)d * T_enc);
+                core_replay::read_named(rgf, "enc_layer_0", b.data(), b.size() * sizeof(float));
+                FILE* f = fopen(dp, "wb");
+                if (f) {
+                    fwrite(b.data(), sizeof(float), b.size(), f);
+                    fclose(f);
+                    fprintf(stderr, "moss_transcribe: dumped enc_layer_0 (%d,%d)\n", d, T_enc);
+                }
+            }
+        }
+        if (const char* dp = crispasr_env::get("CRISPASR_MOSS_TRANSCRIBE_ENC_DUMP")) {
+            FILE* f = fopen(dp, "wb");
+            if (f) {
+                fwrite(result, sizeof(float), (size_t)out_dim * T_enc, f);
+                fclose(f);
+                fprintf(stderr, "moss_transcribe: dumped encoder_output (%d,%d) win=%d\n", out_dim, T_enc, win);
+            }
+        }
+        if (out_T_enc)
+            *out_T_enc = T_enc;
+        if (out_d)
+            *out_d = out_dim;
+        return result;
+    }
+
     ggml_cgraph* gf = moss_transcribe_build_encoder_xf_graph(ctx, T_enc);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -907,11 +1004,18 @@ extern "C" float* moss_transcribe_run_encoder(struct moss_transcribe_context* ct
 // ===========================================================================
 
 static ggml_cgraph* moss_transcribe_build_adapter_graph(moss_transcribe_context* ctx, int T_enc) {
+    struct ggml_init_params gparams = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(gparams);
+    ggml_cgraph* gf = moss_transcribe_build_adapter_graph_into(ctx, ctx0, T_enc);
+    ggml_free(ctx0);
+    return gf;
+}
+
+static ggml_cgraph* moss_transcribe_build_adapter_graph_into(moss_transcribe_context* ctx, ggml_context* ctx0,
+                                                             int T_enc) {
     const auto& hp = ctx->model.hparams;
     const int d_enc = (int)hp.enc_output_dim;
 
-    struct ggml_init_params gparams = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(gparams);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
 
     ggml_tensor* enc_out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_enc, T_enc);
@@ -932,6 +1036,35 @@ extern "C" float* moss_transcribe_run_adapter(struct moss_transcribe_context* ct
         return nullptr;
     const auto& hp = ctx->model.hparams;
     const int d_llm = (int)hp.llm_hidden;
+
+    // §replay: allocate-once/compute-many adapter path (gated by
+    // CRISPASR_MOSS_TRANSCRIBE_REPLAY, same as the encoder-xf path).
+    if (crispasr_env::truthy("CRISPASR_MOSS_TRANSCRIBE_REPLAY")) {
+        if (!ctx->adapter_replay || ctx->adapter_replay_T_enc != T_enc) {
+            ctx->adapter_replay =
+                std::make_unique<core_replay::ReplayGraph>(ctx->backend, ctx->backend_cpu, 4096, [&](ggml_context* c) {
+                    return moss_transcribe_build_adapter_graph_into(ctx, c, T_enc);
+                });
+            ctx->adapter_replay_T_enc = T_enc;
+            if (!ctx->adapter_replay->graph()) {
+                fprintf(stderr, "moss_transcribe: failed to build replay adapter graph\n");
+                return nullptr;
+            }
+        }
+        ggml_cgraph* rgf = ctx->adapter_replay->graph();
+        core_replay::set_named(rgf, "enc_output_in", encoder_out, (size_t)d_enc * T_enc * sizeof(float));
+        if (!ctx->adapter_replay->replay()) {
+            fprintf(stderr, "moss_transcribe: replay adapter compute failed\n");
+            return nullptr;
+        }
+        if (out_T)
+            *out_T = T_enc;
+        if (out_d)
+            *out_d = d_llm;
+        float* result = (float*)malloc((size_t)d_llm * T_enc * sizeof(float));
+        core_replay::read_named(rgf, "adapter_output", result, (size_t)d_llm * T_enc * sizeof(float));
+        return result;
+    }
 
     ggml_cgraph* gf = moss_transcribe_build_adapter_graph(ctx, T_enc);
     ggml_backend_sched_reset(ctx->sched);

@@ -849,6 +849,11 @@ add_library(crispasr-core STATIC
             core/greedy_decode.h
             core/gguf_loader.h
             core/gguf_loader.cpp
+            # Allocate-once / compute-many graph primitive (portable CUDAGraph-
+            # equivalent). Header-only, like the other core/* helpers; inlines
+            # straight into each caller. Lives in crispasr-core because it needs
+            # the ggml-impl.h include path this target exposes privately.
+            core/replay_graph.h
             core/rvq.h
             core/rvq.cpp
             # F5-TTS Chinese g2p (#294): jieba-min + pypinyin TONE3 + sandhi.
@@ -1595,6 +1600,11 @@ endif()
 add_library(moss_transcribe STATIC moss_transcribe.h moss_transcribe.cpp)
 set_target_properties(moss_transcribe PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(moss_transcribe PUBLIC .)
+# §replay: core/replay_graph.h accesses the cgraph `uid` field +
+# ggml_graph_next_uid(), both declared only in ggml's internal ggml-impl.h
+# (under ggml/src/, same as crispasr-core for gguf_loader). Expose the path
+# privately to this target.
+target_include_directories(moss_transcribe PRIVATE ../ggml/src)
 target_compile_features   (moss_transcribe PUBLIC cxx_std_17)
 target_link_libraries     (moss_transcribe PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 if(NOT MSVC)
