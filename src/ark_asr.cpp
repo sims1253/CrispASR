@@ -15,6 +15,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <memory> // std::unique_ptr for §replay encoder graph cache
 
 #include "core/attention.h"
 #include "core/beam_decode.h"
@@ -23,6 +24,7 @@
 #include "core/gguf_loader.h"
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/replay_graph.h"     // §replay allocate-once/compute-many encoder graph
 
 #include <cmath>
 #include <cstdio>
@@ -153,6 +155,14 @@ struct ark_asr_context {
     ggml_tensor* kv_k = nullptr;
     ggml_tensor* kv_v = nullptr;
     int kv_max_ctx = 0;
+
+    // §replay: allocate-once/compute-many encoder graph (portable CUDAGraph-
+    // equivalent). nullptr until the first replay-path encode of a given
+    // T_mel; rebuilt only when T_mel changes. Owns its own private gallocr +
+    // persistent context, so reusing across calls is safe (no stale buffer
+    // pointers). Gated by CRISPASR_ARKASR_REPLAY.
+    std::unique_ptr<core_replay::ReplayGraph> enc_replay;
+    int enc_replay_T_mel = 0;
 
     // tokenizer
     std::vector<std::string> vocab;
@@ -540,14 +550,31 @@ static ggml_tensor* ark_enc_attn(ggml_context* c, ggml_tensor* x, const ark_enc_
 
 // Build the encoder+adapter graph. mel input is [T_mel, n_mels]. Output tensor
 // "audio_embeds" has shape [llm_hidden, N] where N = T_enc / merge_factor.
+// Forward decl: ark_build_encoder_graph delegates to the _into variant so the
+// legacy per-call rebuild and the §replay allocate-once path share the
+// byte-identical builder.
+static ggml_cgraph* ark_build_encoder_graph_into(ark_asr_context* ctx, ggml_context* c, int T_mel);
+
 static ggml_cgraph* ark_build_encoder_graph(ark_asr_context* ctx, int T_mel) {
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* c = ggml_init(ip);
+    // NOTE: c is intentionally NOT freed here — the returned cgraph's tensor
+    // metadata lives in c's arena, which must outlive the graph's use in
+    // ark_encode. compute_meta is reused on the next build (overwriting the
+    // arena), matching the original pre-replay behavior. (Same pattern as the
+    // sibling moss_transcribe / parakeet build helpers.)
+    return ark_build_encoder_graph_into(ctx, c, T_mel);
+}
+
+// Core encoder+adapter builder: constructs the forward in the GIVEN context
+// (ctx->compute_meta for the legacy rebuild, or a ReplayGraph's persistent
+// arena for the replay path).
+static ggml_cgraph* ark_build_encoder_graph_into(ark_asr_context* ctx, ggml_context* c, int T_mel) {
     const auto& hp = ctx->hp;
     const auto& m = ctx->model;
     const int d = (int)hp.enc_d_model;
     const int n_mels = (int)hp.n_mels;
 
-    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* c = ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(c, 16384, false);
 
     ggml_tensor* mel = ggml_new_tensor_2d(c, GGML_TYPE_F32, T_mel, n_mels);
@@ -601,6 +628,49 @@ static ggml_cgraph* ark_build_encoder_graph(ark_asr_context* ctx, int T_mel) {
 
 // Returns malloc'd [hidden, N] audio embeddings; sets *out_hidden and *out_n.
 static float* ark_encode(ark_asr_context* ctx, const float* mel, int T_mel, int* out_hidden, int* out_n) {
+    // §replay: allocate-once/compute-many encoder path. Builds the encoder+
+    // adapter graph ONCE per T_mel into a ReplayGraph (private gallocr + stable
+    // nonzero uid → CUDA-graph capture on CUDA; skip rebuild+realloc on other
+    // backends), then replays with fresh inputs. Gated by
+    // CRISPASR_ARKASR_REPLAY; default is the legacy rebuild path.
+    if (crispasr_env::truthy("CRISPASR_ARKASR_REPLAY")) {
+        if (!ctx->enc_replay || ctx->enc_replay_T_mel != T_mel) {
+            ctx->enc_replay =
+                std::make_unique<core_replay::ReplayGraph>(ctx->backend, ctx->backend_cpu, 16384, [&](ggml_context* c) {
+                    return ark_build_encoder_graph_into(ctx, c, T_mel);
+                });
+            ctx->enc_replay_T_mel = T_mel;
+            if (!ctx->enc_replay->graph()) {
+                fprintf(stderr, "ark_asr: failed to build replay encoder graph\n");
+                return nullptr;
+            }
+        }
+        ggml_cgraph* rgf = ctx->enc_replay->graph();
+        ggml_tensor* mel_t = ggml_graph_get_tensor(rgf, "mel");
+        core_replay::set_named(rgf, "mel", mel, (size_t)ggml_nelements(mel_t) * sizeof(float));
+        ggml_tensor* pos_t = ggml_graph_get_tensor(rgf, "enc_positions");
+        {
+            std::vector<int32_t> p((size_t)pos_t->ne[0]);
+            for (int i = 0; i < (int)p.size(); i++)
+                p[i] = i;
+            core_replay::set_named(rgf, "enc_positions", p.data(), p.size() * sizeof(int32_t));
+        }
+        if (!ctx->enc_replay->replay()) {
+            fprintf(stderr, "ark_asr: replay encoder compute failed\n");
+            return nullptr;
+        }
+        ggml_tensor* out = ggml_graph_get_tensor(rgf, "audio_embeds");
+        const int hidden = (int)out->ne[0];
+        const int N = (int)out->ne[1];
+        float* r = (float*)malloc((size_t)hidden * N * sizeof(float));
+        core_replay::read_named(rgf, "audio_embeds", r, (size_t)hidden * N * sizeof(float));
+        if (out_hidden)
+            *out_hidden = hidden;
+        if (out_n)
+            *out_n = N;
+        return r;
+    }
+
     ggml_cgraph* gf = ark_build_encoder_graph(ctx, T_mel);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
