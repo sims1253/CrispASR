@@ -16,6 +16,8 @@
 #include "core/crispasr_env.h"
 #include "parakeet_ja_detect.h"
 
+#include <memory> // std::unique_ptr for §replay encoder graph cache
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -36,6 +38,7 @@
 #include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/ctc.h"
 #include "core/fastconformer.h"
+#include "core/replay_graph.h" // §replay allocate-once/compute-many encoder graph
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -272,6 +275,15 @@ struct parakeet_context {
     ggml_cgraph* cached_enc_gf = nullptr;
     std::vector<uint8_t> cached_enc_meta;
     int cached_enc_T_mel = 0;
+
+    // §replay: allocate-once/compute-many encoder graph (the portable
+    // CUDAGraph-equivalent). nullptr until the first replay-path encode of a
+    // given T_mel; rebuilt only when T_mel changes. Unlike cached_enc_gf this
+    // owns its own private gallocr + persistent context, so reusing it across
+    // calls is safe (issue #208's stale-pointer hazard does not apply). Gated
+    // by CRISPASR_PARAKEET_REPLAY.
+    std::unique_ptr<core_replay::ReplayGraph> enc_replay;
+    int enc_replay_T_mel = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -806,17 +818,34 @@ static void parakeet_fold_batchnorm(parakeet_model& model, ggml_backend_t backen
 static const float kLayerNormEps = 1e-5f;
 static const float kBatchNormEps = 1e-5f;
 
-static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_mel) {
-    const auto& m = ctx->model;
-    const auto& hp = m.hparams;
-    const int n_mels = (int)hp.n_mels;
+// Forward decl: parakeet_build_graph_encoder delegates to the _into variant
+// (defined below), which builds the forward in a caller-supplied context so
+// both the legacy per-call rebuild and the §replay allocate-once path share
+// the byte-identical builder.
+static ggml_cgraph* parakeet_build_graph_encoder_into(parakeet_context* ctx, ggml_context* ctx0, int T_mel);
 
+static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_mel) {
     ggml_init_params ip = {
         /*mem_size=*/ctx->compute_meta.size(),
         /*mem_buffer=*/ctx->compute_meta.data(),
         /*no_alloc=*/true,
     };
     ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = parakeet_build_graph_encoder_into(ctx, ctx0, T_mel);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Core encoder graph builder: constructs the forward in the GIVEN ggml_context
+// (no_alloc=true metadata context — either ctx->compute_meta for the legacy
+// per-call rebuild, or a ReplayGraph's persistent arena for the replay path).
+// Returns the cgraph; the caller owns/frees ctx0. Split out so both paths
+// build the byte-identical graph.
+static ggml_cgraph* parakeet_build_graph_encoder_into(parakeet_context* ctx, ggml_context* ctx0, int T_mel) {
+    const auto& m = ctx->model;
+    const auto& hp = m.hparams;
+    const int n_mels = (int)hp.n_mels;
+
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
 
     // ----- Input -----
@@ -880,7 +909,6 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
 
     ggml_set_name(cur, "enc_out");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
     return gf;
 }
 
@@ -938,6 +966,96 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
     const bool use_enc_cache = getenv("CRISPASR_PARAKEET_ENC_CACHE") != nullptr;
     const bool probe_time = crispasr_env::get("CRISPASR_PARAKEET_ENC_PROBE") != nullptr;
     bool enc_cache_hit = false;
+
+    // §replay: allocate-once/compute-many path. Builds the encoder graph ONCE
+    // per T_mel into a ReplayGraph that owns its own private gallocr +
+    // persistent context, then replays it every call with fresh inputs — no
+    // per-call rebuild, no sched_reset/sched_alloc_graph. On CUDA the graph's
+    // stable nonzero uid lets ggml-cuda reuse a captured CUDA graph; on other
+    // backends the stable uid is harmless and we still skip rebuild+realloc.
+    // This is the safe successor to the issue-#208 cache: because the graph
+    // lives in its OWN context with its OWN gallocr (never fed through the
+    // shared ctx->sched's reset/alloc cycle), there are no stale buffer
+    // pointers on reuse. Gated OFF by default; verify byte-exactness per
+    // model before flipping.
+    if (crispasr_env::truthy("CRISPASR_PARAKEET_REPLAY")) {
+        const int64_t t_build0 = probe_time ? ggml_time_us() : 0;
+        if (!ctx->enc_replay || ctx->enc_replay_T_mel != T_mel) {
+            ctx->enc_replay =
+                std::make_unique<core_replay::ReplayGraph>(ctx->backend, ctx->backend_cpu, 8192, [&](ggml_context* c) {
+                    return parakeet_build_graph_encoder_into(ctx, c, T_mel);
+                });
+            ctx->enc_replay_T_mel = T_mel;
+            if (!ctx->enc_replay->graph()) {
+                fprintf(stderr, "parakeet: failed to build replay encoder graph\n");
+                return {};
+            }
+        }
+        const int64_t t_build_us = probe_time ? ggml_time_us() - t_build0 : 0;
+        ggml_cgraph* rgf = ctx->enc_replay->graph();
+
+        // Bind inputs by name (identical staging as the legacy path below).
+        core_replay::set_named(rgf, "mel", mel, (size_t)n_mels * T_mel * sizeof(float));
+        ggml_tensor* pos_in = ggml_graph_get_tensor(rgf, "pos_enc");
+        int T_enc = (int)pos_in->ne[1];
+        T_enc = (T_enc + 1) / 2; // pos_enc has 2T-1 columns; recover T
+        auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
+        core_replay::set_named(rgf, "pos_enc", pe.data(), pe.size() * sizeof(float));
+        {
+            const auto& hp = ctx->model.hparams;
+            // Local attention mask (when present in the graph).
+            if (ggml_graph_get_tensor(rgf, "local_attn_mask")) {
+                auto lm = core_conformer::make_local_attn_mask(T_enc, hp.att_context_left, hp.att_context_right,
+                                                               (int)hp.global_tokens);
+                core_replay::set_named(rgf, "local_attn_mask", lm.data(), lm.size() * sizeof(float));
+            }
+            // Windowed-attention band mask (when present in the graph).
+            if (ggml_graph_get_tensor(rgf, "window_band_mask")) {
+                const int BS = core_conformer::fc_window_block_size(hp.att_context_left, hp.att_context_right);
+                auto bm = core_conformer::make_window_band_mask(T_enc, hp.att_context_left, hp.att_context_right,
+                                                                (int)hp.global_tokens, BS);
+                core_replay::set_named(rgf, "window_band_mask", bm.data(), bm.size() * sizeof(float));
+            }
+        }
+
+        const int64_t t_comp0 = probe_time ? ggml_time_us() : 0;
+        if (!ctx->enc_replay->replay()) {
+            fprintf(stderr, "parakeet: replay encoder graph compute failed\n");
+            return {};
+        }
+        const int64_t t_comp_us = probe_time ? ggml_time_us() - t_comp0 : 0;
+
+        ggml_tensor* out = ggml_graph_get_tensor(rgf, "enc_out");
+        if (!out) {
+            fprintf(stderr, "parakeet: missing enc_out tensor\n");
+            return {};
+        }
+        const int d = (int)out->ne[0];
+        const int Te = (int)out->ne[1];
+        if (out_T_enc)
+            *out_T_enc = Te;
+
+        std::vector<float> result((size_t)d * Te);
+        core_replay::read_named(rgf, "enc_out", result.data(), result.size() * sizeof(float));
+        if (probe_time) {
+            double s = 0, s2 = 0;
+            const size_t n = result.size();
+            for (float v : result) {
+                s += v;
+                s2 += (double)v * v;
+            }
+            const double mean = s / n;
+            const double var = s2 / n - mean * mean;
+            static int call_idx = 0;
+            fprintf(stderr,
+                    "[enc-probe] call=%d T_mel=%d T_enc=%d cache=replay mean=%.6f std=%.6f first=%.6f,%.6f "
+                    "build=%.2fms alloc=0.00ms compute=%.2fms\n",
+                    call_idx++, T_mel, Te, mean, var > 0 ? sqrt(var) : 0.0, n > 0 ? result[0] : 0.0,
+                    n > 1 ? result[1] : 0.0, t_build_us / 1000.0, t_comp_us / 1000.0);
+        }
+        return result;
+    }
+
     int64_t t_build0 = probe_time ? ggml_time_us() : 0;
     if (use_enc_cache && ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
         gf = ctx->cached_enc_gf;
